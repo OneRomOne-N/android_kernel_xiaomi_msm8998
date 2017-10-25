@@ -362,6 +362,22 @@ static int lpm_cpu_callback(struct notifier_block *cpu_nb,
 	return NOTIFY_OK;
 }
 
+#ifdef CONFIG_ARM_PSCI
+static int __init set_cpuidle_ops(void)
+{
+	int ret = 0, cpu;
+
+	for_each_possible_cpu(cpu) {
+		ret = arm_cpuidle_init(cpu);
+		if (ret)
+			goto exit;
+	}
+
+exit:
+	return ret;
+}
+#endif
+
 static enum hrtimer_restart lpm_hrtimer_cb(struct hrtimer *h)
 {
 	return HRTIMER_NORESTART;
@@ -1100,10 +1116,14 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 		bool from_idle, int predicted)
 {
 	struct lpm_cluster_level *level = &cluster->levels[idx];
+	struct cpumask online_cpus;
 	int ret, i;
 
+	cpumask_and(&online_cpus, &cluster->num_children_in_sync,
+					cpu_online_mask);
+
 	if (!cpumask_equal(&cluster->num_children_in_sync, &cluster->child_cpus)
-			|| is_IPI_pending(&cluster->num_children_in_sync)) {
+			|| is_IPI_pending(&online_cpus)) {
 		return -EPERM;
 	}
 
@@ -1131,6 +1151,8 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 		struct cpumask nextcpu, *cpumask;
 		uint64_t us;
 		uint32_t pred_us;
+		uint64_t sec;
+		uint64_t nsec;
 
 		us = get_cluster_sleep_time(cluster, &nextcpu,
 						from_idle, &pred_us);
@@ -1142,11 +1164,20 @@ static int cluster_configure(struct lpm_cluster *cluster, int idx,
 			goto failed_set_mode;
 		}
 
-		us = (us + 1) * 1000;
 		clear_predict_history();
 		clear_cl_predict_history();
 
-		do_div(us, NSEC_PER_SEC/SCLK_HZ);
+		us = us + 1;
+		sec = us;
+		do_div(sec, USEC_PER_SEC);
+		nsec = us - sec * USEC_PER_SEC;
+
+		sec = sec * SCLK_HZ;
+		if (nsec > 0) {
+			nsec = nsec * NSEC_PER_USEC;
+			do_div(nsec, NSEC_PER_SEC/SCLK_HZ);
+		}
+		us = sec + nsec;
 		msm_mpm_enter_sleep(us, from_idle, cpumask);
 	}
 
@@ -1942,6 +1973,14 @@ static int __init lpm_levels_module_init(void)
 		pr_info("Error registering %s\n", lpm_driver.driver.name);
 		goto fail;
 	}
+
+#ifdef CONFIG_ARM_PSCI
+	rc = set_cpuidle_ops();
+	if (rc) {
+		pr_err("%s(): Failed to set cpuidle ops\n", __func__);
+		goto fail;
+	}
+#endif
 
 fail:
 	return rc;

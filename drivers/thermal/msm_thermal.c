@@ -4996,7 +4996,7 @@ static ssize_t __ref store_cc_enabled(struct kobject *kobj,
 		hotplug_init_cpu_offlined();
 		mutex_lock(&core_control_mutex);
 		update_offline_cores(cpus_offlined);
-		if (hotplug_enabled) {
+		if (hotplug_enabled && hotplug_task) {
 			for_each_possible_cpu(cpu) {
 				if (!(msm_thermal_info.core_control_mask &
 					BIT(cpus[cpu].cpu)))
@@ -7409,11 +7409,11 @@ static int msm_thermal_dev_probe(struct platform_device *pdev)
 		pr_err("thermal pre init failed. err:%d\n", ret);
 		goto probe_exit;
 	}
+	probe_sensor_info(node, &data, pdev);
 	ret = probe_deferrable_properties(node, &data, pdev);
 	if (ret)
 		goto probe_exit;
 
-	probe_sensor_info(node, &data, pdev);
 	probe_cc(node, &data, pdev);
 	probe_freq_mitigation(node, &data, pdev);
 	probe_cx_phase_ctrl(node, &data, pdev);

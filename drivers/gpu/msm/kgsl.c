@@ -255,6 +255,13 @@ static void _deferred_put(struct work_struct *work)
 	kgsl_mem_entry_put(entry);
 }
 
+static inline void
+kgsl_mem_entry_put_deferred(struct kgsl_mem_entry *entry)
+{
+	if (entry)
+		queue_work(kgsl_driver.mem_workqueue, &entry->work);
+}
+
 static inline struct kgsl_mem_entry *
 kgsl_mem_entry_create(void)
 {
@@ -265,6 +272,7 @@ kgsl_mem_entry_create(void)
 
 		/* put this ref in the caller functions after init */
 		kref_get(&entry->refcount);
+		INIT_WORK(&entry->work, _deferred_put);
 	}
 	return entry;
 }
@@ -1860,7 +1868,7 @@ long kgsl_ioctl_sharedmem_free(struct kgsl_device_private *dev_priv,
 		return -EINVAL;
 
 	ret = gpumem_free_entry(entry);
-	kgsl_mem_entry_put(entry);
+	kgsl_mem_entry_put_deferred(entry);
 
 	return ret;
 }
@@ -1878,7 +1886,7 @@ long kgsl_ioctl_gpumem_free_id(struct kgsl_device_private *dev_priv,
 		return -EINVAL;
 
 	ret = gpumem_free_entry(entry);
-	kgsl_mem_entry_put(entry);
+	kgsl_mem_entry_put_deferred(entry);
 
 	return ret;
 }
@@ -1915,8 +1923,7 @@ static void gpuobj_free_fence_func(void *priv)
 {
 	struct kgsl_mem_entry *entry = priv;
 
-	INIT_WORK(&entry->work, _deferred_put);
-	queue_work(kgsl_driver.mem_workqueue, &entry->work);
+	kgsl_mem_entry_put_deferred(entry);
 }
 
 static long gpuobj_free_on_fence(struct kgsl_device_private *dev_priv,
@@ -1980,7 +1987,7 @@ long kgsl_ioctl_gpuobj_free(struct kgsl_device_private *dev_priv,
 	else
 		ret = -EINVAL;
 
-	kgsl_mem_entry_put(entry);
+	kgsl_mem_entry_put_deferred(entry);
 	return ret;
 }
 
@@ -2209,21 +2216,23 @@ static int kgsl_setup_dmabuf_useraddr(struct kgsl_device *device,
 		if (fd != 0)
 			dmabuf = dma_buf_get(fd - 1);
 	}
-	up_read(&current->mm->mmap_sem);
 
-	if (IS_ERR_OR_NULL(dmabuf))
+	if (IS_ERR_OR_NULL(dmabuf)) {
+		up_read(&current->mm->mmap_sem);
 		return dmabuf ? PTR_ERR(dmabuf) : -ENODEV;
+	}
 
 	ret = kgsl_setup_dma_buf(device, pagetable, entry, dmabuf);
 	if (ret) {
 		dma_buf_put(dmabuf);
+		up_read(&current->mm->mmap_sem);
 		return ret;
 	}
 
 	/* Setup the user addr/cache mode for cache operations */
 	entry->memdesc.useraddr = hostptr;
 	_setup_cache_mode(entry, vma);
-
+	up_read(&current->mm->mmap_sem);
 	return 0;
 }
 #else
@@ -2260,7 +2269,7 @@ static long _gpuobj_map_useraddr(struct kgsl_device *device,
 		struct kgsl_mem_entry *entry,
 		struct kgsl_gpuobj_import *param)
 {
-	struct kgsl_gpuobj_import_useraddr useraddr;
+	struct kgsl_gpuobj_import_useraddr useraddr = {0};
 	int ret;
 
 	param->flags &= KGSL_MEMFLAGS_GPUREADONLY
@@ -3355,7 +3364,13 @@ long kgsl_ioctl_sparse_phys_free(struct kgsl_device_private *dev_priv,
 	if (entry == NULL)
 		return -EINVAL;
 
+	if (!kgsl_mem_entry_set_pend(entry)) {
+		kgsl_mem_entry_put(entry);
+		return -EBUSY;
+	}
+
 	if (entry->memdesc.cur_bindings != 0) {
+		kgsl_mem_entry_unset_pend(entry);
 		kgsl_mem_entry_put(entry);
 		return -EINVAL;
 	}
@@ -3364,7 +3379,7 @@ long kgsl_ioctl_sparse_phys_free(struct kgsl_device_private *dev_priv,
 
 	/* One put for find_id(), one put for the kgsl_mem_entry_create() */
 	kgsl_mem_entry_put(entry);
-	kgsl_mem_entry_put(entry);
+	kgsl_mem_entry_put_deferred(entry);
 
 	return 0;
 }
@@ -3424,7 +3439,13 @@ long kgsl_ioctl_sparse_virt_free(struct kgsl_device_private *dev_priv,
 	if (entry == NULL)
 		return -EINVAL;
 
+	if (!kgsl_mem_entry_set_pend(entry)) {
+		kgsl_mem_entry_put(entry);
+		return -EBUSY;
+	}
+
 	if (entry->bind_tree.rb_node != NULL) {
+		kgsl_mem_entry_unset_pend(entry);
 		kgsl_mem_entry_put(entry);
 		return -EINVAL;
 	}
@@ -3433,7 +3454,7 @@ long kgsl_ioctl_sparse_virt_free(struct kgsl_device_private *dev_priv,
 
 	/* One put for find_id(), one put for the kgsl_mem_entry_create() */
 	kgsl_mem_entry_put(entry);
-	kgsl_mem_entry_put(entry);
+	kgsl_mem_entry_put_deferred(entry);
 
 	return 0;
 }
@@ -3448,7 +3469,7 @@ static int _sparse_add_to_bind_tree(struct kgsl_mem_entry *entry,
 	struct sparse_bind_object *new;
 	struct rb_node **node, *parent = NULL;
 
-	new = kzalloc(sizeof(*new), GFP_KERNEL);
+	new = kzalloc(sizeof(*new), GFP_ATOMIC);
 	if (new == NULL)
 		return -ENOMEM;
 
@@ -3482,7 +3503,6 @@ static int _sparse_rm_from_bind_tree(struct kgsl_mem_entry *entry,
 		struct sparse_bind_object *obj,
 		uint64_t v_offset, uint64_t size)
 {
-	spin_lock(&entry->bind_lock);
 	if (v_offset == obj->v_off && size >= obj->size) {
 		/*
 		 * We are all encompassing, remove the entry and free
@@ -3515,7 +3535,6 @@ static int _sparse_rm_from_bind_tree(struct kgsl_mem_entry *entry,
 
 		obj->size = v_offset - obj->v_off;
 
-		spin_unlock(&entry->bind_lock);
 		ret = _sparse_add_to_bind_tree(entry, v_offset + size,
 				obj->p_memdesc,
 				obj->p_off + (v_offset - obj->v_off) + size,
@@ -3525,19 +3544,16 @@ static int _sparse_rm_from_bind_tree(struct kgsl_mem_entry *entry,
 		return ret;
 	}
 
-	spin_unlock(&entry->bind_lock);
-
 	return 0;
 }
 
+/* entry->bind_lock must be held by the caller */
 static struct sparse_bind_object *_find_containing_bind_obj(
 		struct kgsl_mem_entry *entry,
 		uint64_t offset, uint64_t size)
 {
 	struct sparse_bind_object *obj = NULL;
 	struct rb_node *node = entry->bind_tree.rb_node;
-
-	spin_lock(&entry->bind_lock);
 
 	while (node != NULL) {
 		obj = rb_entry(node, struct sparse_bind_object, node);
@@ -3557,32 +3573,15 @@ static struct sparse_bind_object *_find_containing_bind_obj(
 		}
 	}
 
-	spin_unlock(&entry->bind_lock);
-
 	return obj;
 }
 
+/* entry->bind_lock must be held by the caller */
 static int _sparse_unbind(struct kgsl_mem_entry *entry,
 		struct sparse_bind_object *bind_obj,
 		uint64_t offset, uint64_t size)
 {
-	struct kgsl_memdesc *memdesc = bind_obj->p_memdesc;
-	struct kgsl_pagetable *pt = memdesc->pagetable;
 	int ret;
-
-	if (memdesc->cur_bindings < (size / PAGE_SIZE))
-		return -EINVAL;
-
-	memdesc->cur_bindings -= size / PAGE_SIZE;
-
-	ret = kgsl_mmu_unmap_offset(pt, memdesc,
-			entry->memdesc.gpuaddr, offset, size);
-	if (ret)
-		return ret;
-
-	ret = kgsl_mmu_sparse_dummy_map(pt, &entry->memdesc, offset, size);
-	if (ret)
-		return ret;
 
 	ret = _sparse_rm_from_bind_tree(entry, bind_obj, offset, size);
 	if (ret == 0) {
@@ -3597,6 +3596,8 @@ static long sparse_unbind_range(struct kgsl_sparse_binding_object *obj,
 	struct kgsl_mem_entry *virt_entry)
 {
 	struct sparse_bind_object *bind_obj;
+	struct kgsl_memdesc *memdesc;
+	struct kgsl_pagetable *pt;
 	int ret = 0;
 	uint64_t size = obj->size;
 	uint64_t tmp_size = obj->size;
@@ -3604,9 +3605,14 @@ static long sparse_unbind_range(struct kgsl_sparse_binding_object *obj,
 
 	while (size > 0 && ret == 0) {
 		tmp_size = size;
+
+		spin_lock(&virt_entry->bind_lock);
 		bind_obj = _find_containing_bind_obj(virt_entry, offset, size);
-		if (bind_obj == NULL)
+
+		if (bind_obj == NULL) {
+			spin_unlock(&virt_entry->bind_lock);
 			return 0;
+		}
 
 		if (bind_obj->v_off > offset) {
 			tmp_size = size - bind_obj->v_off - offset;
@@ -3623,7 +3629,28 @@ static long sparse_unbind_range(struct kgsl_sparse_binding_object *obj,
 				tmp_size = bind_obj->size;
 		}
 
+		memdesc = bind_obj->p_memdesc;
+		pt = memdesc->pagetable;
+
+		if (memdesc->cur_bindings < (tmp_size / PAGE_SIZE)) {
+			spin_unlock(&virt_entry->bind_lock);
+			return -EINVAL;
+		}
+
+		memdesc->cur_bindings -= tmp_size / PAGE_SIZE;
+
 		ret = _sparse_unbind(virt_entry, bind_obj, offset, tmp_size);
+		spin_unlock(&virt_entry->bind_lock);
+
+		ret = kgsl_mmu_unmap_offset(pt, memdesc,
+				virt_entry->memdesc.gpuaddr, offset, tmp_size);
+		if (ret)
+			return ret;
+
+		ret = kgsl_mmu_sparse_dummy_map(pt, memdesc, offset, tmp_size);
+		if (ret)
+			return ret;
+
 		if (ret == 0) {
 			offset += tmp_size;
 			size -= tmp_size;
@@ -4699,6 +4726,7 @@ int kgsl_device_platform_probe(struct kgsl_device *device)
 		device->id, device->reg_phys, device->reg_len);
 
 	rwlock_init(&device->context_lock);
+	spin_lock_init(&device->submit_lock);
 
 	setup_timer(&device->idle_timer, kgsl_timer, (unsigned long) device);
 
@@ -4904,7 +4932,7 @@ static int __init kgsl_core_init(void)
 		WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS, 0);
 
 	kgsl_driver.mem_workqueue = alloc_workqueue("kgsl-mementry",
-		WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+		WQ_MEM_RECLAIM, 0);
 
 	kgsl_events_init();
 

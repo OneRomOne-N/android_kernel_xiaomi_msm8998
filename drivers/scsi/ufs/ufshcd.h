@@ -3,8 +3,7 @@
  *
  * This code is based on drivers/scsi/ufs/ufshcd.h
  * Copyright (C) 2011-2013 Samsung India Software Operations
- * Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
- * Copyright (C) 2017 XiaoMi, Inc.
+ * Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
  *
  * Authors:
  *	Santosh Yaraganavi <santosh.sy@samsung.com>
@@ -340,6 +339,8 @@ struct ufs_hba_variant_ops {
 	int	(*update_sec_cfg)(struct ufs_hba *hba, bool restore_sec_cfg);
 	u32	(*get_scale_down_gear)(struct ufs_hba *);
 	int	(*set_bus_vote)(struct ufs_hba *, bool);
+	void	(*phy_off)(struct ufs_hba *);
+	void	(*phy_on)(struct ufs_hba *);
 #ifdef CONFIG_DEBUG_FS
 	void	(*add_debugfs)(struct ufs_hba *hba, struct dentry *root);
 	void	(*remove_debugfs)(struct ufs_hba *hba);
@@ -432,7 +433,7 @@ struct ufs_clk_gating {
 	struct device_attribute enable_attr;
 	bool is_enabled;
 	int active_reqs;
-	struct workqueue_struct *ungating_workq;
+	struct workqueue_struct *clk_gating_workq;
 };
 
 /* Hibern8 state  */
@@ -591,6 +592,22 @@ struct ufshcd_req_stat {
 };
 #endif
 
+enum ufshcd_ctx {
+	QUEUE_CMD,
+	ERR_HNDLR_WORK,
+	H8_EXIT_WORK,
+	UIC_CMD_SEND,
+	PWRCTL_CMD_SEND,
+	TM_CMD_SEND,
+	XFR_REQ_COMPL,
+	CLK_SCALE_WORK,
+};
+
+struct ufshcd_clk_ctx {
+	ktime_t ts;
+	enum ufshcd_ctx ctx;
+};
+
 /**
  * struct ufs_stats - keeps usage/err statistics
  * @enabled: enable tag stats for debugfs
@@ -619,6 +636,10 @@ struct ufs_stats {
 	int query_stats_arr[UPIU_QUERY_OPCODE_MAX][MAX_QUERY_IDN];
 
 #endif
+	u32 last_intr_status;
+	ktime_t last_intr_ts;
+	struct ufshcd_clk_ctx clk_hold;
+	struct ufshcd_clk_ctx clk_rel;
 	u32 hibern8_exit_cnt;
 	ktime_t last_hibern8_exit_tstamp;
 	struct ufs_uic_err_reg_hist pa_err;

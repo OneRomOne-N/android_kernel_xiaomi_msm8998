@@ -1038,14 +1038,12 @@ void q6asm_audio_client_free(struct audio_client *ac)
 	}
 
 	rtac_set_asm_handle(ac->session, NULL);
-	if (!atomic_read(&ac->reset)) {
-		apr_deregister(ac->apr2);
-		apr_deregister(ac->apr);
-		q6asm_mmap_apr_dereg();
-		ac->apr2 = NULL;
-		ac->apr = NULL;
-		ac->mmap_apr = NULL;
-	}
+	apr_deregister(ac->apr2);
+	apr_deregister(ac->apr);
+	q6asm_mmap_apr_dereg();
+	ac->apr2 = NULL;
+	ac->apr = NULL;
+	ac->mmap_apr = NULL;
 	q6asm_session_free(ac);
 
 	pr_debug("%s: APR De-Register\n", __func__);
@@ -3149,16 +3147,21 @@ int q6asm_set_shared_circ_buff(struct audio_client *ac,
 	int bytes_to_alloc, rc;
 	size_t len;
 
+	mutex_lock(&ac->cmd_lock);
+
+	if (ac->port[dir].buf) {
+		pr_err("%s: Buffer already allocated\n", __func__);
+		rc = -EINVAL;
+		mutex_unlock(&ac->cmd_lock);
+		goto done;
+	}
+
 	buf_circ = kzalloc(sizeof(struct audio_buffer), GFP_KERNEL);
 
 	if (!buf_circ) {
 		rc = -ENOMEM;
 		goto done;
 	}
-
-	mutex_lock(&ac->cmd_lock);
-
-	ac->port[dir].buf = buf_circ;
 
 	bytes_to_alloc = bufsz * bufcnt;
 	bytes_to_alloc = PAGE_ALIGN(bytes_to_alloc);
@@ -3171,11 +3174,12 @@ int q6asm_set_shared_circ_buff(struct audio_client *ac,
 	if (rc) {
 		pr_err("%s: Audio ION alloc is failed, rc = %d\n", __func__,
 				rc);
-		mutex_unlock(&ac->cmd_lock);
 		kfree(buf_circ);
+		mutex_unlock(&ac->cmd_lock);
 		goto done;
 	}
 
+	ac->port[dir].buf = buf_circ;
 	buf_circ->used = dir ^ 1;
 	buf_circ->size = bytes_to_alloc;
 	buf_circ->actual_size = bytes_to_alloc;
@@ -3189,11 +3193,12 @@ int q6asm_set_shared_circ_buff(struct audio_client *ac,
 	open->shared_circ_buf_start_phy_addr_lsw =
 			lower_32_bits(buf_circ->phys);
 	open->shared_circ_buf_start_phy_addr_msw =
-			upper_32_bits(buf_circ->phys);
+			msm_audio_populate_upper_32_bits(buf_circ->phys);
 	open->shared_circ_buf_size = bufsz * bufcnt;
 
 	open->map_region_circ_buf.shm_addr_lsw = lower_32_bits(buf_circ->phys);
-	open->map_region_circ_buf.shm_addr_msw = upper_32_bits(buf_circ->phys);
+	open->map_region_circ_buf.shm_addr_msw =
+			msm_audio_populate_upper_32_bits(buf_circ->phys);
 	open->map_region_circ_buf.mem_size_bytes = bytes_to_alloc;
 
 	mutex_unlock(&ac->cmd_lock);
@@ -3235,10 +3240,12 @@ int q6asm_set_shared_pos_buff(struct audio_client *ac,
 	open->shared_pos_buf_num_regions = 1;
 	open->shared_pos_buf_property_flag = 0x00;
 	open->shared_pos_buf_phy_addr_lsw = lower_32_bits(buf_pos->phys);
-	open->shared_pos_buf_phy_addr_msw = upper_32_bits(buf_pos->phys);
+	open->shared_pos_buf_phy_addr_msw =
+			msm_audio_populate_upper_32_bits(buf_pos->phys);
 
 	open->map_region_pos_buf.shm_addr_lsw = lower_32_bits(buf_pos->phys);
-	open->map_region_pos_buf.shm_addr_msw = upper_32_bits(buf_pos->phys);
+	open->map_region_pos_buf.shm_addr_msw =
+			msm_audio_populate_upper_32_bits(buf_pos->phys);
 	open->map_region_pos_buf.mem_size_bytes = bytes_to_alloc;
 
 done:
@@ -3333,12 +3340,6 @@ int q6asm_open_shared_io(struct audio_client *ac,
 		open->fmt_id = ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3;
 	else {
 		pr_err("%s: Invalid format[%d]\n", __func__, config->format);
-		rc = -EINVAL;
-		goto done;
-	}
-
-	if (ac->port[dir].buf) {
-		pr_err("%s: Buffer already allocated\n", __func__);
 		rc = -EINVAL;
 		goto done;
 	}

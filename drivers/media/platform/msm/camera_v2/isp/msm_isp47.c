@@ -437,9 +437,13 @@ void msm_vfe47_clear_status_reg(struct vfe_device *vfe_dev)
 void msm_vfe47_process_reset_irq(struct vfe_device *vfe_dev,
 	uint32_t irq_status0, uint32_t irq_status1)
 {
+	unsigned long flags;
+
 	if (irq_status0 & (1 << 31)) {
+		spin_lock_irqsave(&vfe_dev->completion_lock, flags);
 		complete(&vfe_dev->reset_complete);
 		vfe_dev->reset_pending = 0;
+		spin_unlock_irqrestore(&vfe_dev->completion_lock, flags);
 	}
 }
 
@@ -719,6 +723,12 @@ void msm_vfe47_reg_update(struct vfe_device *vfe_dev,
 		vfe_dev->reg_update_requested;
 	if ((vfe_dev->is_split && vfe_dev->pdev->id == ISP_VFE1) &&
 		((frame_src == VFE_PIX_0) || (frame_src == VFE_SRC_MAX))) {
+		if (!vfe_dev->common_data->dual_vfe_res->vfe_base[ISP_VFE0]) {
+			pr_err("%s vfe_base for ISP_VFE0 is NULL\n", __func__);
+			spin_unlock_irqrestore(&vfe_dev->reg_update_lock,
+				flags);
+			return;
+		}
 		msm_camera_io_w_mb(update_mask,
 			vfe_dev->common_data->dual_vfe_res->vfe_base[ISP_VFE0]
 			+ 0x4AC);
@@ -741,8 +751,11 @@ long msm_vfe47_reset_hardware(struct vfe_device *vfe_dev,
 {
 	long rc = 0;
 	uint32_t reset;
+	unsigned long flags;
 
+	spin_lock_irqsave(&vfe_dev->completion_lock, flags);
 	init_completion(&vfe_dev->reset_complete);
+	spin_unlock_irqrestore(&vfe_dev->completion_lock, flags);
 
 	if (blocking_call)
 		vfe_dev->reset_pending = 1;

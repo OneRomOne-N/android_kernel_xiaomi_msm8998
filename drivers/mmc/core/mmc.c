@@ -1310,10 +1310,6 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
 	if (host->caps & MMC_CAP_WAIT_WHILE_BUSY)
 		send_status = false;
 
-	/* Reduce frequency to HS */
-	max_dtr = card->ext_csd.hs_max_dtr;
-	mmc_set_clock(host, max_dtr);
-
 	/* Switch HS400 to HS DDR */
 	val = EXT_CSD_TIMING_HS;
 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL, EXT_CSD_HS_TIMING,
@@ -1323,6 +1319,10 @@ int mmc_hs400_to_hs200(struct mmc_card *card)
 		goto out_err;
 
 	mmc_set_timing(host, MMC_TIMING_MMC_DDR52);
+
+	/* Reduce frequency to HS */
+	max_dtr = card->ext_csd.hs_max_dtr;
+	mmc_set_clock(host, max_dtr);
 
 	if (!send_status) {
 		err = mmc_switch_status(card, false);
@@ -2043,11 +2043,11 @@ reinit:
 	}
 
 	card->clk_scaling_lowest = host->f_min;
-	if ((card->mmc_avail_type | EXT_CSD_CARD_TYPE_HS400) ||
-			(card->mmc_avail_type | EXT_CSD_CARD_TYPE_HS200))
+	if ((card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400) ||
+			(card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS200))
 		card->clk_scaling_highest = card->ext_csd.hs200_max_dtr;
-	else if ((card->mmc_avail_type | EXT_CSD_CARD_TYPE_HS) ||
-			(card->mmc_avail_type | EXT_CSD_CARD_TYPE_DDR_52))
+	else if ((card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS) ||
+			(card->mmc_avail_type & EXT_CSD_CARD_TYPE_DDR_52))
 		card->clk_scaling_highest = card->ext_csd.hs_max_dtr;
 	else
 		card->clk_scaling_highest = card->csd.max_dtr;
@@ -2604,6 +2604,9 @@ static int mmc_partial_init(struct mmc_host *host)
 	if (mmc_card_hs400(card)) {
 		if (card->ext_csd.strobe_support && host->ops->enhanced_strobe)
 			err = host->ops->enhanced_strobe(host);
+		else if (host->ops->execute_tuning)
+			err = host->ops->execute_tuning(host,
+				MMC_SEND_TUNING_BLOCK_HS200);
 	} else if (mmc_card_hs200(card) && host->ops->execute_tuning) {
 		err = host->ops->execute_tuning(host,
 			MMC_SEND_TUNING_BLOCK_HS200);
@@ -2833,6 +2836,7 @@ static int mmc_runtime_suspend(struct mmc_host *host)
 		return -EBUSY;
 	}
 
+	MMC_TRACE(host, "%s\n", __func__);
 	err = _mmc_suspend(host, true);
 	if (err)
 		pr_err("%s: error %d doing aggressive suspend\n",
@@ -2854,6 +2858,7 @@ static int mmc_runtime_resume(struct mmc_host *host)
 	if (!(host->caps & (MMC_CAP_AGGRESSIVE_PM | MMC_CAP_RUNTIME_RESUME)))
 		return 0;
 
+	MMC_TRACE(host, "%s\n", __func__);
 	err = _mmc_resume(host);
 	if (err)
 		pr_err("%s: error %d doing aggressive resume\n",
@@ -2917,6 +2922,22 @@ static int mmc_reset(struct mmc_host *host)
 	return ret;
 }
 
+static int mmc_shutdown(struct mmc_host *host)
+{
+	struct mmc_card *card = host->card;
+
+	/*
+	 * Exit clock scaling so that it doesn't kick in after
+	 * power off notification is sent
+	 */
+	if (host->caps2 & MMC_CAP2_CLK_SCALE)
+		mmc_exit_clk_scaling(card->host);
+	/* send power off notification */
+	if (mmc_card_mmc(card))
+		mmc_send_pon(card);
+	return 0;
+}
+
 static const struct mmc_bus_ops mmc_ops = {
 	.remove = mmc_remove,
 	.detect = mmc_detect,
@@ -2927,6 +2948,7 @@ static const struct mmc_bus_ops mmc_ops = {
 	.alive = mmc_alive,
 	.change_bus_speed = mmc_change_bus_speed,
 	.reset = mmc_reset,
+	.shutdown = mmc_shutdown,
 };
 
 /*

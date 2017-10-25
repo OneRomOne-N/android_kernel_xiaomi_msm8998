@@ -91,6 +91,11 @@ static struct {
 #define cpuhp_lock_acquire()      lock_map_acquire(&cpu_hotplug.dep_map)
 #define cpuhp_lock_release()      lock_map_release(&cpu_hotplug.dep_map)
 
+void cpu_hotplug_mutex_held(void)
+{
+	lockdep_assert_held(&cpu_hotplug.lock);
+}
+EXPORT_SYMBOL(cpu_hotplug_mutex_held);
 
 void get_online_cpus(void)
 {
@@ -498,8 +503,8 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen)
 	ret = __cpu_notify(CPU_UP_PREPARE | mod, hcpu, -1, &nr_calls);
 	if (ret) {
 		nr_calls--;
-		pr_warn("%s: attempt to bring up CPU %u failed\n",
-			__func__, cpu);
+		pr_warn_ratelimited("%s: attempt to bring up CPU %u failed\n",
+				    __func__, cpu);
 		goto out_notify;
 	}
 
